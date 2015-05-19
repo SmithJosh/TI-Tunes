@@ -1,0 +1,13 @@
+# Audio Files #
+###############
+*.wav
+*.mp3
+*.ogg
+
+# Data Files #
+##############
+*.out
+*.rom
+*.hex
+*.8xi
+*.png

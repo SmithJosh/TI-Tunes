@@ -1,0 +1,266 @@
+.nolist
+#include      "ti83plus.inc"
+.list
+.org    $4080
+.db    t2ByteTok, tAsmCmp
+
+; Configure and clear display
+	bcall(_GrBufClr)		; Clear graph buffer
+	bcall(_ClrLCDFull)		; Clear display
+	bcall(_ForceFullScreen)	; Make sure we're in fullscreen mode
+	set	BufferOnly, (IY+plotFlag3)		; Only draw to buffer
+	set fullScrnDraw, (IY + apiFlg4)	; Enables full screen drawing for interfaces
+	set textWrite, (IY + sGrFlags)		; Write text to graph buffer only
+
+; ==================================================================================
+	
+; Verify calc model
+	di
+	in	a, ($02)
+	bit	7, a
+	jr	NZ, correctModel
+	ld	hl, incorrectModelMsg
+	call	myPutS
+	bcall(_NewLine)
+	
+	ld	bc, $FFFF
+WaitLoop:
+    ex	(sp), hl
+	ex	(sp), hl
+	ex	(sp), hl
+	ex	(sp), hl
+	cpd
+    jp	pe, WaitLoop
+	
+	bcall(_JForceCmdNoChar)	; Exit app if wrong model
+
+correctModel:
+	rla
+	sbc	a, a
+	out	($20), a			; Set CPU speed to 15Mhz (mode 1)
+
+; ===================================================================================
+	
+; Setup interrupts
+	ld	hl, $1C1A			; Coordinates (28,26)
+	ld	(PenCol), hl
+	ld	hl, ConfigText
+	call	myVPutS
+	bcall(_GrBufCpy)		; Display "Configuring..."
+	
+	di
+	in	a, ($2E)
+	push	af				; Backup RAM & Flash memory access delay
+	in	a, ($06)
+	push	af
+	xor	a
+	out	($03), a			; Disable standard interrupts
+	out	($2E), a			; Remove RAM & Flash memory access delay
+	
+	ld	c, $35
+	ld	hl, AudioStart
+	ex	af, af'
+	exx						; Init shadow reg's. Store timer2 counter port in c, audio data pointer in hl, link port data in a.	
+	
+	ld	hl, $9900 
+    ld	de, $9901
+    ld	(hl), $9A 
+    ld	bc, 256 
+    ldir					; Setup interrupt mode 2 table
+	
+    ld 	hl, BitrateInterrupt
+	ld 	de, $9A9A
+	ld	bc, BitrateInterruptEnd-BitrateInterrupt
+	ldir					; Copy interrupt to RAM
+	
+	ld	hl, KeyLoop
+	ld 	de, $9B00
+	ld	bc, QuitEnd-KeyLoop
+	ldir					; Copy main loop to RAM
+	
+	ld	a, $99
+	ld	i, a
+	im	2
+	
+	; set up timer 1
+    ld	a, $9A				; BB = CPU clock / 64 
+    out	($30), a
+    ld	a, 3				; Loop and interrupt
+    out	($31), a
+    ld	a, 21				; Interrupt will fire 15E6/118/6 ~= 21000
+    out	($32), a
+	; set up timer 2
+	ld	a, $80				; CPU speed / 2
+	out	($33), a
+	ld	a, $02				; Generate interrupt but don't loop
+	out	($34), a
+	ei
+	
+; ===================================================================================
+	
+	ld	a, $FF 				; Reset the keypad
+	out	($01), a
+	ld	a, %11111101
+	out	($01), a
+	
+	jp	$9B00				; Jump to KeyLoop
+KeyLoop:
+    in	a, ($01)			; Check for [CLEAR] to exit (Port FD)
+    and	%01000000
+    jr	NZ, KeyLoop
+	jr	Quit
+	
+endSong:	
+	ex	af, af'				;'
+	exx
+	
+Quit:
+	di
+    ld	a, $FF          	
+    out	($01), a			; Reset key port
+	xor	a
+	out	($00), a			; Set link port lines low
+	out	($03), a
+	out	($30), a			; Reset timer 0
+	out	($31), a			; v 
+	out	($33), a			; Reset timer 1
+	out	($34), a			; v
+	im	1
+	ld	a, %00001011		
+	out	($03), a			; Restore normal interrupt operation
+	pop af
+	out ($06), a
+	pop	af
+	out	($2E), a			; Restore memory access delays
+    bcall(_JForceCmdNoChar)	; Exit app
+QuitEnd:
+
+; ===================================================================================
+
+; This interrupt is called at the audio sample rate and schedules the PWM interrupt
+; Preserved shadow registers: de'
+BitrateInterrupt: 
+    ex	af, af' 	;4'
+	xor	%00000011	;4
+	jp	NZ, PWMOn-BitrateInterrupt+$9A9A	;10/1
+
+PWMOff:
+	out	($00), a	;11
+	xor	%00000010	;4		; a = 2
+	out ($34), a	;11		; Acknowledge interrupt
+	xor a			;4
+	ex	af, af'		;4'
+	ei				;4
+	ret				;10		; End interrupt if PWM timer caused it
+	
+PWMOn:
+	exx				;4
+    out	($31), a	;11		; Acknowledge interrupt
+	outi			;16		; out (c), (hl) \ inc hl \ dec b
+	jp	Z, endSong-KeyLoop+$9B00 ;10/1	; If sample == $00
+	
+	dec h			;4		; P/V is set if operand was $80 before operation
+	out	($00), a	;11
+	jp	PE, NxtPage-BitrateInterrupt+$9A9A ;10/1
+	
+	ei				;4
+	ex	af, af'		;4'		; Interrupts enabled after this instruction
+	inc h			;4
+	ld	b, (hl)		;7		; b' = sample value
+	inc b			;4
+	exx				;4
+	ret				;10
+	
+; When page is switched, interrupt takes 113 cycles, but doesn't matter
+; because only affects one byte of audio playback out of ~16384
+NxtPage:					
+	ld	h, $40		;7
+	in	a, ($06)	;11
+	dec a			;4
+	out ($06), a	;11
+	ld	a, 3		;7
+	ei				;4
+	ex	af, af'		;4'		; Interrupts enabled after this instruction
+	ld	b, (hl)		;7		; b' = sample value
+	inc b			;4
+	exx				;4
+	ret				;10
+BitrateInterruptEnd:
+;Normal: 65(On)/66(Off) = 131
+;NxtPage: 113(On)
+;Overhead: 29(On)/25(Nxt)
+						
+;##############
+;# Procedures #
+;##############
+
+;inputs: a = key group
+;outputs: a = key code
+;destroys: a, b
+DirectInput:
+	ld	b, a
+	ld	a, $FF 				; Reset the keypad
+	out	($01), a
+	ld	a, b
+	out	($01), a
+	in	a, ($01)
+	ret
+	
+;Inline vPutS
+;input: same
+;output: same
+;destroys: none
+
+myVPutS:
+	push	af
+vPutSLoop:
+	ld	a, (hl)
+	inc	hl
+	or	a
+	jr	z, doneVPutting
+	bcall(_vPutMap)
+	jr	vPutSLoop
+doneVPutting:
+	pop	af
+	ret
+	
+;Inline PutS
+;input: same
+;output: same
+;destroys: none
+
+myPutS:
+	push	bc
+	push	af
+	ld	a, (winBtm)
+	ld	b, a 			; b = bottom line of window
+myPutS10:
+	ld	a, (hl)			; get a character of string name
+	inc	hl
+	or	a 				; end of string?
+	scf 				; indicate entire string was displayed		
+	jr	Z, myPutS20 	; yes --->
+	bcall(_PutC)			; display one character of string
+	ld	a, (curRow) 	; check cursor position
+	cp	b 				; off end of window?
+	jr	C, myPutS10 	; no, display rest of string
+myPutS20:
+	pop	bc 				; restore A (but not F)
+	ld	a, b
+	pop	bc				; restore BC
+	ret
+	
+;########
+;# Data #
+;########
+
+ConfigText:
+	.db	"Configuring...", 0
+	
+incorrectModelMsg:
+	.db	"An SE/84 is     "
+	.db	"required.", 0
+	
+AudioStart:
+; 0 - 1: Sample Rate
+; 2 - ...: Audio Data

@@ -1,0 +1,431 @@
+#include "ti83plus.inc"
+#include "app.inc"
+defpage(0, "PlayWav ")
+validate()
+
+; Configure and clear display
+	bcall(_GrBufClr)		; Clear graph buffer
+	bcall(_ClrLCDFull)		; Clear display
+	bcall(_ForceFullScreen)	; Make sure we're in fullscreen mode
+	set	BufferOnly, (IY+plotFlag3)		; Only draw to buffer
+	set fullScrnDraw, (IY + apiFlg4)	; Enables full screen drawing for interfaces
+	set textWrite, (IY + sGrFlags)		; Write text to graph buffer only
+
+; ==================================================================================
+	
+; Verify calc model
+	di
+	in	a, ($02)
+	bit	7, a
+	jr	NZ, correctModel
+	ld	hl, incorrectModelMsg
+	call	myPutS
+	bcall(_NewLine)
+	
+	ld	bc, $FFFF
+WaitLoop:
+    ex	(sp), hl
+	ex	(sp), hl
+	ex	(sp), hl
+	ex	(sp), hl
+	cpd
+    jp	pe, WaitLoop
+	
+	bcall(_JForceCmdNoChar)	; Exit app if wrong model
+
+correctModel:
+	rla
+	sbc	a, a
+	out	($20), a			; Set CPU speed to 15Mhz (mode 1)
+
+; ===================================================================================
+	
+; Check CPU speed and backup in AppVar. If already exists, read into OP1
+Configuration:
+	ld	hl, $1C1A			; Coordinates (28,26)
+	ld	(PenCol), hl
+	ld	hl, ConfigText
+	call	myVPutS
+	bcall(_GrBufCpy)		; Display "Configuring..."
+
+	ld	hl, CPUSpeed
+	rst	rMOV9TOOP1
+	bcall(_ChkFindSym) 
+	jr	NC, AppvExists		
+
+CreateAppv:
+	; Find CPU Speed
+	ld	hl, 9				; 9 data bytes
+	bcall(_CreateAppVar)
+	push	de
+	call	findCPUSpeed
+	bcall(_PopRealO1)		; Restore OP1 (CPU speed)
+	pop	de
+	inc	de
+	inc	de
+	ld	hl, OP1
+	ld	bc, 8
+	ldir	
+	
+	ld	hl, (AudioHeader)
+	bcall(_SetXXXXOP2)		; Set OP2 to interrupt rate (will be in wav header)
+	call	findDivisors
+	jr	DispPlayer
+	
+AppvExists:
+	ld	a, b
+	or	a
+	jr	Z, AppvInRAM
+	
+AppvArchived:
+	ex	de, hl
+	ld	a, 1+2+7+8+2		; Valid Flag (1), Data size (2), VAT entry (7 + Name Length), size (2)
+
+SkipHeader:					; Skip past variable header in archive
+	bcall(_LoadDEIndPaged)
+	dec a
+	jr	NZ, SkipHeader
+	
+	ld	a, b
+	ld	de, OP1
+	ld	bc, 9
+	bcall(_FlashToRAM)		; Read from Flash to OP1
+	jr	DispPlayer
+	
+AppvInRAM:
+	ex	de, hl
+	inc hl
+	inc hl
+	ld	de, OP1
+	ld	bc, 9
+	ldir					; Read from RAM to OP1
+	
+DispPlayer:
+	bcall(_GrBufClr)
+	ld	hl, PlayerImage
+	ld	de, PlotSScreen
+	ld	bc, 12*63
+	ldir
+	
+	set	textInverse, (IY + textFlags)
+	ld	hl, $1106			; Coordinates (06c,26r)
+	ld	(PenCol), hl
+	ld	hl, AudioHeader + 2
+	call	myVPutS
+	
+	ld	hl, $1906			; Coordinates (06c,26r)
+	ld	(PenCol), hl
+	ld	hl, AudioHeader + 2
+	call	myVPutS
+	
+	ld	hl, $2106			; Coordinates (06c,26r)
+	ld	(PenCol), hl
+	ld	hl, AudioHeader + 2
+	call	myVPutS
+	
+	; Display title, sample rate, length(?)
+	
+	bcall(_GrBufCpy)
+	;ld	a,	8
+	;bcall(_FormEReal)
+	;ld	hl, OP3
+	;call	myPutS
+	
+; ===================================================================================	
+
+SetupInterrupts:
+	di
+	in	a, ($2E)
+	push	af				; Backup RAM & Flash memory access delay
+	in	a, ($06)
+	push	af
+	xor	a
+	out	($03), a			; Disable standard interrupts
+	out	($2E), a			; Remove RAM & Flash memory access delay
+	
+	ld	c, $35
+	ld	d, $03
+	ld	hl, AudioData
+	ex	af, af'
+	exx						; Init shadow reg's. Store timer2 counter port in c, audio data pointer in hl, link port data in a.	
+	
+	ld	hl, $9900 
+    ld	de, $9901
+    ld	(hl), $9A 
+    ld	bc, 256 
+    ldir					; Setup interrupt mode 2 table
+	
+    ld 	hl, BitrateInterrupt
+	ld 	de, $9A9A
+	ld	bc, BitrateInterruptEnd-BitrateInterrupt
+	ldir					; Copy interrupt to RAM
+	
+	ld	hl, KeyLoop
+	ld 	de, $9B00
+	ld	bc, QuitEnd-KeyLoop
+	ldir					; Copy main loop to RAM
+	
+	ld	a, $99
+	ld	i, a
+	im	2
+	
+	; set up timer 1
+    ld	a, $9A				; BB = CPU clock / 64 
+    out	($30), a
+    ld	a, 3				; Loop and interrupt
+    out	($31), a
+    ld	a, 13				; Interrupt will fire 15E6/118/6 ~= 21000
+    out	($32), a
+	; set up timer 2
+	ld	a, $80				; CPU speed / 2
+	out	($33), a
+	ld	a, $02				; Generate interrupt but don't loop
+	out	($34), a
+	ei
+	
+; ===================================================================================
+	
+	ld	a, $FF 				; Reset the keypad
+	out	($01), a
+	ld	a, %10111111
+	out	($01), a
+	
+	jp	$9B00				; Jump to KeyLoop
+KeyLoop:
+    in	a, ($01)			; Check for [CLEAR] to exit (Port FD)
+    inc	a
+	add a, $10			
+    jp	NC, $9B00			; Jump to KeyLoop
+
+	jp	Z, PauseResume-KeyLoop+$9B00
+	jp	Quit-KeyLoop+$9B00
+
+PauseResume:
+	ld	a, i
+	di
+	ld	b, 0
+	jp	PE, PauseLoop-KeyLoop+$9B00
+	ld	b, $10
+PauseLoop:
+	in	a, ($01)
+	and %00010000
+	jp	Z, PauseLoop-KeyLoop+$9B00
+	sub	b
+	jp	NZ, $9B00
+	ei
+	jp	$9B00
+	
+Quit:
+	di
+    ld	a, $FF          	
+    out	($01), a			; Reset key port
+	xor	a
+	out	($00), a			; Set link port lines low
+	out	($03), a
+	out	($30), a			; Reset timer 0
+	out	($31), a			; v 
+	out	($33), a			; Reset timer 1
+	out	($34), a			; v
+	im	1
+	ld	a, %00001011		
+	out	($03), a			; Restore normal interrupt operation
+	pop af
+	out ($06), a
+	pop	af
+	out	($2E), a			; Restore memory access delays
+    bcall(_JForceCmdNoChar)	; Exit app
+QuitEnd:
+	
+; ===================================================================================
+
+; This interrupt is called at the audio bitrate and schedules the PWM interrupt
+; Unused shadow registers: e'
+BitrateInterrupt: 
+    ex	af, af' 	;4'
+    out	($00), a	;11
+	dec	a			;4
+	jp	P, PWMOff-BitrateInterrupt+$9A9A	;10/1
+	
+	exx				;4
+	ld	a, d		;4		; a = 3
+    out	($31), a	;11		; Acknowledge interrupt
+	outi			;16		; out (c), (hl) \ inc hl \ dec b
+	
+	bit 7, h		;8
+	jp	NZ, NxtPage-BitrateInterrupt+$9A9A ;10/1
+	ei				;4
+	ex	af, af'		;4'		; Interrupts enabled after this instruction
+	exx				;4
+	ret				;10
+	
+; When page is switched, interrupt takes 117 cycles, but doesn't matter
+; because only affects one byte of audio playback out of ~16384
+NxtPage:					
+	ld	h, $40		;7
+	in	a, ($06)	;11
+	dec a			;4
+	;out ($06), a	;11
+	ld	a, 3		;7
+	ei				;4
+	ex	af, af'		;4'		; Interrupts enabled after this instruction
+	exx				;4
+	ret				;10
+		
+PWMOff:
+	out ($34), a	;11		; Acknowledge interrupt
+	xor a			;4
+	ex	af, af'		;4'
+	ei				;4
+	ret				;10		; End interrupt if PWM timer caused it
+BitrateInterruptEnd:	;72/62 = 134
+
+;##############
+;# Procedures #
+;##############
+
+ProgEnd: ; All data below this point are not used after player loads
+
+#include ".\configRoutines.inc"
+
+;inputs: a = key group
+;outputs: a = key code
+;destroys: a, b
+DirectInput:
+	ld	b, a
+	ld	a, $FF 				; Reset the keypad
+	out	($01), a
+	ld	a, b
+	out	($01), a
+	in	a, ($01)
+	ret
+	
+;Inline vPutS
+;input: same
+;output: same
+;destroys: none
+
+myVPutS:
+	push	af
+vPutSLoop:
+	ld	a, (hl)
+	inc	hl
+	or	a
+	jr	z, doneVPutting
+	bcall(_vPutMap)
+	jr	vPutSLoop
+doneVPutting:
+	pop	af
+	ret
+	
+;Inline PutS
+;input: same
+;output: same
+;destroys: none
+
+myPutS:
+	push	bc
+	push	af
+	ld	a, (winBtm)
+	ld	b, a 			; b = bottom line of window
+myPutS10:
+	ld	a, (hl)			; get a character of string name
+	inc	hl
+	or	a 				; end of string?
+	scf 				; indicate entire string was displayed		
+	jr	Z, myPutS20 	; yes --->
+	bcall(_PutC)			; display one character of string
+	ld	a, (curRow) 	; check cursor position
+	cp	b 				; off end of window?
+	jr	C, myPutS10 	; no, display rest of string
+myPutS20:
+	pop	bc 				; restore A (but not F)
+	ld	a, b
+	pop	bc				; restore BC
+	ret
+	
+;########
+;# Data #
+;########
+
+ConfigText:
+	.db	"Configuring...", 0
+	
+incorrectModelMsg:
+	.db	"An SE/84 is     "
+	.db	"required.", 0
+	
+CPUSpeed:
+	.db	AppVarObj, "CPUSpeed", 0
+	
+PlayerImage:
+	.db %01111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111100
+	.db %10000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%10000011,%00011111,%10000011,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11101111,%10111111,%11101111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11101111,%10111111,%11101110,%11101010,%01110001,%11000111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11101111,%10111111,%11101110,%11101001,%10101110,%10111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11101111,%10111111,%11101110,%11101011,%10100000,%11000111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11101111,%10111111,%11101110,%11001011,%10101111,%11111011,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11101111,%00011111,%11101111,%00101011,%10110001,%10000111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111010,%10101010,%10101010,%10101010,%10101010,%10101010,%10101010,%10101010,%10101010,%10101010,%10101010,%10111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111101,%01111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111101,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%01111010
+	.db %10111101,%01111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111010
+	.db %10000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000010
+	.db %01111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111111,%11111100
+	.db %00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000
+	.db %00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000
+	.db %01111111,%11111111,%11000111,%11111111,%11111100,%01111111,%11111111,%11111111,%11111111,%11000111,%11111111,%11111100
+	.db %10000000,%00000000,%00101000,%00000000,%00000010,%10000000,%00000000,%01000000,%00000000,%00101000,%00000000,%00000010
+	.db %10000000,%00000000,%00101000,%00000000,%00000010,%10000000,%10010000,%00000001,%00100000,%00101000,%01111111,%11000010
+	.db %10000001,%10110000,%00101000,%00001110,%00000010,%10000001,%10110000,%01000001,%10110000,%00101000,%10000010,%00100010
+	.db %10000001,%10110000,%00101000,%00001110,%00000010,%10000011,%11110000,%00000001,%11111000,%00101000,%10000110,%00100010
+	.db %10000001,%10110000,%00101000,%00001110,%00000010,%10000001,%10110000,%01000001,%10110000,%00101000,%01001111,%11000010
+	.db %10000000,%00000000,%00101000,%00000000,%00000010,%10000000,%10010000,%00000001,%00100000,%00101000,%00000110,%00000010
+	.db %10000000,%00000000,%00101000,%00000000,%00000010,%10000000,%00000000,%01000000,%00000000,%00101000,%00000010,%00000010
+	.db %01111111,%11111111,%11000111,%11111111,%11111100,%01111111,%11111111,%11111111,%11111111,%11000111,%11111111,%11111100
+	.db %00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000,%00000000
+	
+AudioHeader:
+	.db	$08, $52	; First two bytes are sample rate of the audio file
+	.db "Basshunter - Angel", 0	; Following 22 bytes reserved for song title
+	
+AudioData:
+	
