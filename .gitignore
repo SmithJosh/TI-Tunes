@@ -1,3 +1,10 @@
+# Directories #
+###############
+Conversion/
+Reference/
+TestProgs/
+trimheaderSource/
+
 # Audio Files #
 ###############
 *.wav
@@ -9,5 +16,11 @@
 *.out
 *.rom
 *.hex
-*.8xi
 *.png
+
+# Calc Files #
+##############
+*.8xi
+*.8xk
+*.8xp
+
